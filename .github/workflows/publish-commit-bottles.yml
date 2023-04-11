@@ -53,35 +53,8 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - name: Post comment once started
-        uses: Homebrew/actions/post-comment@master
-        with:
-          token: ${{secrets.GITHUB_TOKEN}}
-          issue: ${{github.event.inputs.pull_request}}
-          body: ":shipit: @${{github.actor}} has [requested bottles to be published to this PR](${{env.RUN_URL}})."
-          bot_body: ":robot: A scheduled task has [requested bottles to be published to this PR](${{env.RUN_URL}})."
-          bot: BrewTestBot
-
-      - name: Set up Homebrew
-        id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@master
-        with:
-          test-bot: false
-
-      - name: Configure Git user
-        id: git-user-config
-        uses: Homebrew/actions/git-user-config@master
-        with:
-          username: BrewTestBot
-
-      - name: Set up commit signing
-        uses: Homebrew/actions/setup-commit-signing@master
-        with:
-          signing_key: ${{ secrets.BREWTESTBOT_GPG_SIGNING_SUBKEY }}
-
       - name: Check PR branch for mergeability
         id: pr-branch-check
-        working-directory: ${{steps.set-up-homebrew.outputs.repository-path}}
         env:
           GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
         run: |
@@ -97,6 +70,7 @@ jobs:
           remote="$(jq --raw-output .head.repo.clone_url <<< "$pr_data")"
           head_repo="$(jq --raw-output .head.repo.full_name <<< "$pr_data")"
           head_repo_owner="$(jq --raw-output .head.repo.owner.login <<< "$pr_data")"
+          head_sha="$(jq --raw-output .head.sha <<< "$pr_data")"
           fork_type="$(jq --raw-output .head.repo.owner.type <<< "$pr_data")"
           labels="$(jq --raw-output '.labels[].name' <<< "$pr_data")"
 
@@ -106,12 +80,14 @@ jobs:
              [ -z "$remote" ] ||
              [ -z "$head_repo" ] ||
              [ -z "$head_repo_owner" ] ||
+             [ -z "$head_sha" ] ||
              [ -z "$fork_type" ]
           then
             echo "::error ::Failed to get PR data!"
             exit 1
           fi
 
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           bottles=true
           for label in ${labels}
           do
@@ -152,22 +128,64 @@ jobs:
           gh pr edit --add-label 'no push access' '${{inputs.pull_request}}'
           exit 1
 
+      - name: Post comment once started
+        uses: Homebrew/actions/post-comment@master
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          issue: ${{github.event.inputs.pull_request}}
+          body: ":shipit: @${{github.actor}} has [requested bottles to be published to this PR](${{env.RUN_URL}})."
+          bot_body: ":robot: A scheduled task has [requested bottles to be published to this PR](${{env.RUN_URL}})."
+          bot: BrewTestBot
+
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+        with:
+          test-bot: false
+
+      - name: Configure Git user
+        id: git-user-config
+        uses: Homebrew/actions/git-user-config@master
+        with:
+          username: BrewTestBot
+
+      - name: Set up commit signing
+        uses: Homebrew/actions/setup-commit-signing@master
+        with:
+          signing_key: ${{ secrets.BREWTESTBOT_GPG_SIGNING_SUBKEY }}
+
       - name: Checkout PR branch
         if: fromJson(steps.pr-branch-check.outputs.bottles)
-        run: gh pr checkout '${{github.event.inputs.pull_request}}'
+        working-directory: ${{steps.set-up-homebrew.outputs.repository-path}}
         env:
           GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
-        working-directory: ${{steps.set-up-homebrew.outputs.repository-path}}
+        run: gh pr checkout '${{github.event.inputs.pull_request}}'
 
       - name: Pull and upload bottles to GitHub Packages
+        id: pr-pull
         if: fromJson(steps.pr-branch-check.outputs.bottles)
+        working-directory: ${{steps.set-up-homebrew.outputs.repository-path}}
         env:
           BREWTESTBOT_NAME_EMAIL: "${{ steps.git-user-config.outputs.name }} <${{ steps.git-user-config.outputs.email }}>"
           HOMEBREW_GPG_PASSPHRASE: ${{ secrets.BREWTESTBOT_GPG_SIGNING_SUBKEY_PASSPHRASE }}
           HOMEBREW_GITHUB_API_TOKEN: ${{secrets.HOMEBREW_CORE_PUBLIC_REPO_EMAIL_TOKEN}}
           HOMEBREW_GITHUB_PACKAGES_USER: brewtestbot
           HOMEBREW_GITHUB_PACKAGES_TOKEN: ${{secrets.HOMEBREW_CORE_GITHUB_PACKAGES_TOKEN}}
+          EXPECTED_SHA: ${{steps.pr-branch-check.outputs.head_sha}}
         run: |
+          local_git_head="$(git rev-parse HEAD)"
+          remote_git_head="$(git ls-remote origin 'pull/${{inputs.pull_request}}/head')"
+
+          if [ "$local_git_head" != "$EXPECTED_SHA" ] ||
+             [ "$remote_git_head" != "$EXPECTED_SHA" ]
+          then
+            echo "::error ::Unexpected change in target branch."
+            echo "::error ::Expected SHA1    $EXPECTED_SHA"
+            echo "::error ::Checked out SHA1 $local_git_head"
+            echo "::error ::PR branch SHA1   $remote_git_head"
+            exit 1
+          fi
+
           # Don't quote arguments that might be empty; this causes errors.
           brew pr-pull \
             --debug \
@@ -179,6 +197,8 @@ jobs:
             ${{inputs.warn_on_upload_failure && '--warn-on-upload-failure' || ''}} \
             ${{inputs.message && format('--message="{0}"', inputs.message) || ''}} \
             '${{github.event.inputs.pull_request}}'
+
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push commits
         if: fromJson(steps.pr-branch-check.outputs.bottles)
@@ -209,8 +229,8 @@ jobs:
         with:
           token: ${{secrets.GITHUB_TOKEN}}
           issue: ${{github.event.inputs.pull_request}}
-          body: ":warning: @${{github.actor}} bottle publish [failed](${{env.RUN_URL}})."
-          bot_body: ":warning: Bottle publish [failed](${{env.RUN_URL}})."
+          body: ":warning: @${{github.actor}} bottle publish [failed](${{env.RUN_URL}}). CC @carlocab"
+          bot_body: ":warning: Bottle publish [failed](${{env.RUN_URL}}). CC @carlocab"
           bot: BrewTestBot
 
       - name: Dismiss approvals on failure
@@ -255,12 +275,28 @@ jobs:
             exit 1
           fi
 
-      - name: Enable PR automerge
+      - name: Approve PR and enable automerge
         id: automerge
         env:
           GH_TOKEN: ${{secrets.HOMEBREW_GITHUB_PUBLIC_REPO_TOKEN}}
+          EXPECTED_SHA: ${{steps.pr-pull.outputs.head_sha}}
         working-directory: ${{steps.set-up-homebrew.outputs.repository-path}}
-        run: gh pr merge --auto --merge '${{inputs.pull_request}}'
+        run: |
+          local_git_head="$(git rev-parse HEAD)"
+          remote_git_head="$(git ls-remote origin 'pull/${{inputs.pull_request}}/head')"
+
+          if [ "$local_git_head" != "$EXPECTED_SHA" ] ||
+             [ "$remote_git_head" != "$EXPECTED_SHA" ]
+          then
+            echo "::error ::Unexpected change in target branch."
+            echo "::error ::Expected SHA1    $EXPECTED_SHA"
+            echo "::error ::Checked out SHA1 $local_git_head"
+            echo "::error ::PR branch SHA1   $remote_git_head"
+            exit 1
+          fi
+
+          gh pr merge --auto --merge '${{inputs.pull_request}}'
+          gh pr review --approve '${{inputs.pull_request}}'
 
       - name: Post comment on failure
         if: ${{failure() && steps.automerge.conclusion == 'failure'}}
@@ -268,6 +304,6 @@ jobs:
         with:
           token: ${{secrets.GITHUB_TOKEN}}
           issue: ${{github.event.inputs.pull_request}}
-          body: ":warning: @${{github.actor}} [Failed to enable automerge](${{env.RUN_URL}})."
-          bot_body: ":warning: [Failed to enable automerge](${{env.RUN_URL}})."
+          body: ":warning: @${{github.actor}} [Failed to enable automerge](${{env.RUN_URL}}). CC @carlocab"
+          bot_body: ":warning: [Failed to enable automerge](${{env.RUN_URL}}). CC @carlocab"
           bot: BrewTestBot
